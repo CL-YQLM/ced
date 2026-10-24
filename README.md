@@ -73,10 +73,18 @@ reads a line on the message bar. It takes an optional callback that fires on
 every keystroke, which is the whole trick behind search jumping as you type —
 the callback moves the cursor, and ESC puts it back where it started.
 
+Highlighting stores one colour code per byte of `render`, not of `chars`,
+because that's what gets drawn. Block comments are the awkward part: whether
+a line starts inside one depends on where the line above finished, so each
+row remembers whether it ended with a comment still open, and a row whose
+answer changes pushes a rescan down the file. Type `/*` at the top of a file
+and everything below it goes cyan until something closes it — and because C
+comments don't nest, the first `*/` wins.
+
 ## Not done yet
 
-- syntax highlighting for C
 - SIGWINCH — resizing the terminal mid-session doesn't re-measure
+- C is the only filetype in the table
 - search only finds the first match on a line, so `n` steps line by line
 - normal mode lets the cursor sit one past the last character; vim clamps it
 - scrolled right on a long line, stepping onto a short one scrolls the window

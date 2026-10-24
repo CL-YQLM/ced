@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CED_VERSION "0.4.0"
+#define CED_VERSION "0.5.0"
 #define CED_TAB_STOP 8
 
 /* How many extra times Ctrl-Q has to be pressed to throw away unsaved work. */
@@ -47,18 +47,49 @@ enum editor_mode {
 	MODE_INSERT
 };
 
+enum editor_highlight {
+	HL_NORMAL = 0,
+	HL_COMMENT,
+	HL_MLCOMMENT,
+	HL_KEYWORD1,
+	HL_KEYWORD2,
+	HL_STRING,
+	HL_NUMBER,
+	HL_MATCH
+};
+
+#define HL_HIGHLIGHT_NUMBERS (1 << 0)
+#define HL_HIGHLIGHT_STRINGS (1 << 1)
+
+struct editor_syntax {
+	const char *filetype;
+	const char **filematch;
+	const char **keywords;
+	const char *singleline_comment_start;
+	const char *multiline_comment_start;
+	const char *multiline_comment_end;
+	int flags;
+};
+
 /* One line of the file.
  *
  * `chars` is exactly what sits on disk. `render` is the same line with tabs
  * blown out into spaces, which is what actually goes on screen. Keeping both
  * is what forces the cursor to carry two column numbers: cx indexes chars,
  * rx indexes render, and on any line containing a tab the two disagree.
- * Editing always goes through chars; render is rebuilt from it afterwards. */
+ * Editing always goes through chars; render is rebuilt from it afterwards.
+ *
+ * `hl` is one highlight code per byte of render, not of chars, since it is
+ * consumed while drawing. `idx` is the row's own position, which the
+ * highlighter needs to reach the line above and below. */
 typedef struct erow {
+	int idx;
 	int size;
 	int rsize;
 	char *chars;
 	char *render;
+	unsigned char *hl;
+	int hl_open_comment;	/* line ends with a block comment still open */
 } erow;
 
 struct editor_config {
@@ -75,6 +106,8 @@ struct editor_config {
 	int pending;		/* first key of a two-key command like dd */
 	char *filename;
 	char *last_query;	/* what n and N search for */
+	int match_row;		/* row currently wearing the search highlight */
+	struct editor_syntax *syntax;
 	char statusmsg[80];
 	time_t statusmsg_time;
 	struct termios orig_termios;
@@ -90,6 +123,36 @@ static void editor_refresh_screen(void);
 static int editor_read_key(void);
 static char *editor_prompt(const char *prompt, void (*callback)(char *, int));
 static void editor_move_cursor(int key);
+
+/* ---------- filetypes ---------- */
+
+static const char *C_HL_extensions[] = {
+	".c", ".h", ".cpp", ".cc", ".hpp", NULL
+};
+
+/* Keywords with a trailing bar get the second colour; they are the type
+   names, as opposed to control flow. */
+static const char *C_HL_keywords[] = {
+	"switch", "if", "while", "for", "break", "continue", "return", "else",
+	"struct", "union", "typedef", "static", "enum", "case", "default",
+	"do", "goto", "sizeof", "extern", "const", "volatile", "register",
+	"inline", "restrict",
+
+	"int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+	"void|", "short|", "auto|", "size_t|", "ssize_t|", "time_t|", NULL
+};
+
+static struct editor_syntax HLDB[] = {
+	{
+		"c",
+		C_HL_extensions,
+		C_HL_keywords,
+		"//", "/*", "*/",
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	}
+};
+
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 /* ---------- terminal ---------- */
 
@@ -201,6 +264,222 @@ static int get_window_size(int *rows, int *cols)
 	return 0;
 }
 
+/* ---------- syntax highlighting ---------- */
+
+static int is_separator(int c)
+{
+	return isspace(c) || c == '\0' ||
+	       strchr(",.()+-/*=~%<>[];{}:&|!?", c) != NULL;
+}
+
+/* Work out the highlight code for every byte of this line's render.
+ *
+ * Block comments are what make this more than a per-line job: whether this
+ * line starts inside a comment depends on where the line above finished, so
+ * the state is carried in hl_open_comment and a line whose state flips has to
+ * push a rescan down the file. */
+static void editor_update_syntax(erow *row)
+{
+	const char **keywords;
+	const char *scs, *mcs, *mce;
+	int scs_len, mcs_len, mce_len;
+	int prev_sep = 1;
+	int in_string = 0;
+	int in_comment;
+	int i = 0;
+	int changed;
+
+	free(row->hl);
+	row->hl = NULL;
+	if (row->rsize > 0) {
+		row->hl = malloc((size_t)row->rsize);
+		if (row->hl == NULL)
+			die("malloc");
+		memset(row->hl, HL_NORMAL, (size_t)row->rsize);
+	}
+
+	if (E.syntax == NULL)
+		return;
+
+	keywords = E.syntax->keywords;
+	scs = E.syntax->singleline_comment_start;
+	mcs = E.syntax->multiline_comment_start;
+	mce = E.syntax->multiline_comment_end;
+	scs_len = scs != NULL ? (int)strlen(scs) : 0;
+	mcs_len = mcs != NULL ? (int)strlen(mcs) : 0;
+	mce_len = mce != NULL ? (int)strlen(mce) : 0;
+
+	in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
+
+	while (i < row->rsize) {
+		char c = row->render[i];
+		unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+		/* A line comment swallows the rest of the line, but not if it
+		   is really inside a string or a block comment. */
+		if (scs_len > 0 && in_string == 0 && !in_comment) {
+			if (strncmp(&row->render[i], scs, (size_t)scs_len) == 0) {
+				memset(&row->hl[i], HL_COMMENT,
+				       (size_t)(row->rsize - i));
+				break;
+			}
+		}
+
+		if (mcs_len > 0 && mce_len > 0 && in_string == 0) {
+			if (in_comment) {
+				row->hl[i] = HL_MLCOMMENT;
+				if (strncmp(&row->render[i], mce,
+					    (size_t)mce_len) == 0) {
+					memset(&row->hl[i], HL_MLCOMMENT,
+					       (size_t)mce_len);
+					i += mce_len;
+					in_comment = 0;
+					prev_sep = 1;
+					continue;
+				}
+				i++;
+				continue;
+			} else if (strncmp(&row->render[i], mcs,
+					   (size_t)mcs_len) == 0) {
+				memset(&row->hl[i], HL_MLCOMMENT,
+				       (size_t)mcs_len);
+				i += mcs_len;
+				in_comment = 1;
+				continue;
+			}
+		}
+
+		if (E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+			if (in_string != 0) {
+				row->hl[i] = HL_STRING;
+				/* A backslash escapes the next byte, so a quote
+				   straight after one closes nothing. */
+				if (c == '\\' && i + 1 < row->rsize) {
+					row->hl[i + 1] = HL_STRING;
+					i += 2;
+					continue;
+				}
+				if (c == in_string)
+					in_string = 0;
+				i++;
+				prev_sep = 1;
+				continue;
+			} else if (c == '"' || c == '\'') {
+				in_string = c;
+				row->hl[i] = HL_STRING;
+				i++;
+				continue;
+			}
+		}
+
+		if (E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+			/* Only count a digit that starts a word, or carries on
+			   one already being highlighted, so the 2 in "x2" stays
+			   plain. The dot keeps decimals in one piece. */
+			if ((isdigit((unsigned char)c) &&
+			     (prev_sep || prev_hl == HL_NUMBER)) ||
+			    (c == '.' && prev_hl == HL_NUMBER)) {
+				row->hl[i] = HL_NUMBER;
+				i++;
+				prev_sep = 0;
+				continue;
+			}
+		}
+
+		if (prev_sep) {
+			int j;
+
+			for (j = 0; keywords[j] != NULL; j++) {
+				int klen = (int)strlen(keywords[j]);
+				int kw2 = keywords[j][klen - 1] == '|';
+
+				if (kw2)
+					klen--;
+
+				/* The character after has to be a separator too,
+				   or "int" would light up inside "integer".
+				   render is NUL-terminated, so reading one past
+				   the last byte is safe and counts as one. */
+				if (strncmp(&row->render[i], keywords[j],
+					    (size_t)klen) == 0 &&
+				    is_separator(row->render[i + klen])) {
+					memset(&row->hl[i],
+					       kw2 ? HL_KEYWORD2 : HL_KEYWORD1,
+					       (size_t)klen);
+					i += klen;
+					break;
+				}
+			}
+			if (keywords[j] != NULL) {
+				prev_sep = 0;
+				continue;
+			}
+		}
+
+		prev_sep = is_separator(c);
+		i++;
+	}
+
+	changed = (row->hl_open_comment != in_comment);
+	row->hl_open_comment = in_comment;
+
+	/* The comment state at the end of this line changed, so every line
+	   below was highlighted on a stale assumption. Recursion stops as soon
+	   as a line's state comes out the same as before. */
+	if (changed && row->idx + 1 < E.numrows)
+		editor_update_syntax(&E.row[row->idx + 1]);
+}
+
+static int editor_syntax_to_color(int hl)
+{
+	switch (hl) {
+	case HL_COMMENT:
+	case HL_MLCOMMENT:	return 36;	/* cyan */
+	case HL_KEYWORD1:	return 33;	/* yellow */
+	case HL_KEYWORD2:	return 32;	/* green */
+	case HL_STRING:		return 35;	/* magenta */
+	case HL_NUMBER:		return 31;	/* red */
+	case HL_MATCH:		return 34;	/* blue */
+	default:		return 37;	/* white */
+	}
+}
+
+static void editor_select_syntax_highlight(void)
+{
+	unsigned int entry;
+	char *ext;
+
+	E.syntax = NULL;
+	if (E.filename == NULL)
+		return;
+
+	ext = strrchr(E.filename, '.');
+
+	for (entry = 0; entry < HLDB_ENTRIES; entry++) {
+		struct editor_syntax *s = &HLDB[entry];
+		int i = 0;
+
+		while (s->filematch[i] != NULL) {
+			int is_ext = (s->filematch[i][0] == '.');
+
+			if ((is_ext && ext != NULL &&
+			     strcmp(ext, s->filematch[i]) == 0) ||
+			    (!is_ext &&
+			     strstr(E.filename, s->filematch[i]) != NULL)) {
+				int row;
+
+				E.syntax = s;
+				/* Rows read before the filetype was known were
+				   highlighted as plain text. */
+				for (row = 0; row < E.numrows; row++)
+					editor_update_syntax(&E.row[row]);
+				return;
+			}
+			i++;
+		}
+	}
+}
+
 /* ---------- rows ---------- */
 
 /* Which screen column does character `cx` of this line land on? */
@@ -249,11 +528,14 @@ static void editor_update_row(erow *row)
 	}
 	row->render[idx] = '\0';
 	row->rsize = idx;
+
+	editor_update_syntax(row);
 }
 
 static void editor_insert_row(int at, const char *s, size_t len)
 {
 	erow *grown;
+	int j;
 
 	if (at < 0 || at > E.numrows)
 		return;
@@ -265,7 +547,11 @@ static void editor_insert_row(int at, const char *s, size_t len)
 
 	/* Open a gap at `at` by sliding everything below it down one slot. */
 	memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+	/* Those rows all moved, and the highlighter navigates by idx. */
+	for (j = at + 1; j <= E.numrows; j++)
+		E.row[j].idx = j;
 
+	E.row[at].idx = at;
 	E.row[at].size = (int)len;
 	E.row[at].chars = malloc(len + 1);
 	if (E.row[at].chars == NULL)
@@ -275,9 +561,14 @@ static void editor_insert_row(int at, const char *s, size_t len)
 
 	E.row[at].rsize = 0;
 	E.row[at].render = NULL;
+	E.row[at].hl = NULL;
+	E.row[at].hl_open_comment = 0;
+
+	/* numrows has to be right before highlighting runs, because a block
+	   comment cascade walks forward through the rows. */
+	E.numrows++;
 	editor_update_row(&E.row[at]);
 
-	E.numrows++;
 	E.dirty++;
 }
 
@@ -285,10 +576,13 @@ static void editor_free_row(erow *row)
 {
 	free(row->render);
 	free(row->chars);
+	free(row->hl);
 }
 
 static void editor_del_row(int at)
 {
+	int j;
+
 	if (at < 0 || at >= E.numrows)
 		return;
 
@@ -296,6 +590,13 @@ static void editor_del_row(int at)
 	memmove(&E.row[at], &E.row[at + 1],
 		sizeof(erow) * (E.numrows - at - 1));
 	E.numrows--;
+	for (j = at; j < E.numrows; j++)
+		E.row[j].idx = j;
+
+	/* The line that closed a block comment may have just gone. */
+	if (at < E.numrows)
+		editor_update_syntax(&E.row[at]);
+
 	E.dirty++;
 }
 
@@ -522,6 +823,10 @@ static void editor_open(const char *filename)
 	if (E.filename == NULL)
 		die("strdup");
 
+	/* Pick the filetype before reading, so rows are highlighted as they
+	   come in rather than needing a second pass. */
+	editor_select_syntax_highlight();
+
 	fp = fopen(filename, "r");
 	if (fp == NULL) {
 		/* A name that is not on disk yet just means a new file: start
@@ -561,6 +866,8 @@ static void editor_save(void)
 			editor_set_status_message("Save cancelled");
 			return;
 		}
+		/* The new name may well have told us the filetype. */
+		editor_select_syntax_highlight();
 	}
 
 	buf = editor_rows_to_string(&len);
@@ -595,6 +902,15 @@ static void editor_save(void)
 
 /* ---------- search ---------- */
 
+/* Drop the search highlight by simply re-running the highlighter over the
+   row that is wearing it. */
+static void editor_clear_match_highlight(void)
+{
+	if (E.match_row >= 0 && E.match_row < E.numrows)
+		editor_update_syntax(&E.row[E.match_row]);
+	E.match_row = -1;
+}
+
 /* Jump to the next line matching `query`, starting one line off from where
    the cursor is. Only the first hit on a line is found, which is enough for
    stepping through a file. */
@@ -608,6 +924,7 @@ static int editor_search_from(const char *query, int from, int direction)
 
 	for (i = 0; i < E.numrows; i++) {
 		char *match;
+		erow *row;
 
 		current += direction;
 		if (current == -1)
@@ -615,15 +932,34 @@ static int editor_search_from(const char *query, int from, int direction)
 		else if (current == E.numrows)
 			current = 0;
 
-		match = strstr(E.row[current].chars, query);
-		if (match != NULL) {
-			E.cy = current;
-			E.cx = (int)(match - E.row[current].chars);
-			/* Shove rowoff past the end so the next scroll() pass
-			   brings the match onto the screen. */
-			E.rowoff = E.numrows;
-			return 1;
+		row = &E.row[current];
+		match = strstr(row->chars, query);
+		if (match == NULL)
+			continue;
+
+		editor_clear_match_highlight();
+
+		E.cy = current;
+		E.cx = (int)(match - row->chars);
+		/* Shove rowoff past the end so the next scroll() pass brings
+		   the match onto the screen. */
+		E.rowoff = E.numrows;
+
+		/* hl is indexed by render, so the chars offset has to be
+		   converted first. A query containing a tab would measure the
+		   wrong width here, which is not worth handling. */
+		if (row->hl != NULL) {
+			int rx = editor_row_cx_to_rx(row, E.cx);
+			int n = (int)strlen(query);
+
+			if (rx + n > row->rsize)
+				n = row->rsize - rx;
+			if (n > 0)
+				memset(&row->hl[rx], HL_MATCH, (size_t)n);
+			E.match_row = current;
 		}
+
+		return 1;
 	}
 
 	return 0;
@@ -674,6 +1010,7 @@ static void editor_find(void)
 		E.last_query = query;		/* kept for n and N */
 	} else {
 		/* Cancelled, so put the view back exactly as it was. */
+		editor_clear_match_highlight();
 		E.cx = saved_cx;
 		E.cy = saved_cy;
 		E.coloff = saved_coloff;
@@ -819,9 +1156,46 @@ static void editor_draw_rows(struct abuf *ab)
 				len = 0;
 			if (len > E.screencols)
 				len = E.screencols;
-			if (len > 0)
-				ab_append(ab, &E.row[filerow].render[E.coloff],
-					  len);
+
+			if (len > 0) {
+				const char *c =
+					&E.row[filerow].render[E.coloff];
+				const unsigned char *hl =
+					&E.row[filerow].hl[E.coloff];
+				int current_color = -1;
+				int j;
+
+				for (j = 0; j < len; j++) {
+					if (hl[j] == HL_NORMAL) {
+						if (current_color != -1) {
+							ab_append(ab,
+								  "\x1b[39m",
+								  5);
+							current_color = -1;
+						}
+					} else {
+						int color =
+						    editor_syntax_to_color(hl[j]);
+
+						if (color != current_color) {
+							char seq[16];
+							int slen;
+
+							slen = snprintf(
+								seq,
+								sizeof(seq),
+								"\x1b[%dm",
+								color);
+							current_color = color;
+							ab_append(ab, seq, slen);
+						}
+					}
+					ab_append(ab, &c[j], 1);
+				}
+				/* Leave the line in the default colour so the
+				   status bar below is not tinted. */
+				ab_append(ab, "\x1b[39m", 5);
+			}
 		}
 
 		/* Erase whatever used to be on the rest of this line. Cheaper
@@ -834,7 +1208,7 @@ static void editor_draw_rows(struct abuf *ab)
 static void editor_draw_status_bar(struct abuf *ab)
 {
 	char left[128];
-	char right[32];
+	char right[48];
 	int llen, rlen;
 
 	ab_append(ab, "\x1b[7m", 4);		/* swap foreground and back */
@@ -843,7 +1217,9 @@ static void editor_draw_status_bar(struct abuf *ab)
 			E.filename != NULL ? E.filename : "[no name]",
 			E.dirty > 0 ? " [+]" : "",
 			E.mode == MODE_INSERT ? "-- INSERT --" : "-- NORMAL --");
-	rlen = snprintf(right, sizeof(right), "%d/%d", E.cy + 1, E.numrows);
+	rlen = snprintf(right, sizeof(right), "%s | %d/%d",
+			E.syntax != NULL ? E.syntax->filetype : "no ft",
+			E.cy + 1, E.numrows);
 
 	if (llen < 0)
 		llen = 0;
@@ -1319,6 +1695,8 @@ static void init_editor(void)
 	E.pending = 0;
 	E.filename = NULL;
 	E.last_query = NULL;
+	E.match_row = -1;
+	E.syntax = NULL;
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
 

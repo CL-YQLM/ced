@@ -1,4 +1,5 @@
 ced
+ced-asan
 *.o
 *.d
 core

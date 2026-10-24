@@ -12,16 +12,24 @@ POSIX only, since `termios` doesn't exist on Windows. WSL is fine.
 
 ```sh
 make
-./ced
+./ced file.c
 ```
 
 ## Keys
 
 ```
-ctrl-q    quit
+arrows, home/end, pgup/pgdn   move around
+ctrl-q                        quit
 ```
+
+## Implementation notes
+
+Every line is kept twice: `chars` is the bytes on disk, `render` is the same
+line with tabs expanded to 8-column stops. That's why the cursor needs two
+column numbers — `cx` indexes `chars`, `rx` indexes `render`, and the two
+only agree on lines without tabs. Horizontal scrolling has to work off `rx`
+or indented lines jump by the wrong amount.
 
 ## Not done yet
 
-Opening files, moving around, editing, saving. Right now it draws a screen
-and exits cleanly.
+Editing and saving. Right now it's read-only.

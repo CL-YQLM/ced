@@ -5,16 +5,23 @@
  * escape sequences.
  */
 
+#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
-#define CED_VERSION "0.2.0"
+#define CED_VERSION "0.3.0"
 #define CED_TAB_STOP 8
+
+/* How many extra times Ctrl-Q has to be pressed to throw away unsaved work. */
+#define CED_QUIT_TIMES 3
 
 /* A terminal strips the upper three bits of a byte while Ctrl is held, so
    Ctrl-Q shows up as 0x11. Masking with 0x1f does the same thing. */
@@ -23,6 +30,7 @@
 /* Keys that arrive as multi-byte escape sequences are mapped to values no
    single byte can hold, so they can never be mistaken for text. */
 enum editor_key {
+	BACKSPACE = 127,
 	ARROW_LEFT = 1000,
 	ARROW_RIGHT,
 	ARROW_UP,
@@ -39,7 +47,8 @@ enum editor_key {
  * `chars` is exactly what sits on disk. `render` is the same line with tabs
  * blown out into spaces, which is what actually goes on screen. Keeping both
  * is what forces the cursor to carry two column numbers: cx indexes chars,
- * rx indexes render, and on any line containing a tab the two disagree. */
+ * rx indexes render, and on any line containing a tab the two disagree.
+ * Editing always goes through chars; render is rebuilt from it afterwards. */
 typedef struct erow {
 	int size;
 	int rsize;
@@ -52,15 +61,22 @@ struct editor_config {
 	int rx;			/* cursor column once tabs are expanded */
 	int rowoff;		/* first file row visible on screen */
 	int coloff;		/* first render column visible on screen */
-	int screenrows;
+	int screenrows;		/* text rows, excluding the message bar */
 	int screencols;
 	int numrows;
 	erow *row;
+	int dirty;		/* edits made since the last save */
 	char *filename;
+	char statusmsg[80];
+	time_t statusmsg_time;
 	struct termios orig_termios;
 };
 
 static struct editor_config E;
+
+/* Lives down in the output section, but the save path needs to report with
+   it. */
+static void editor_set_status_message(const char *fmt, ...);
 
 /* ---------- terminal ---------- */
 
@@ -215,31 +231,194 @@ static void editor_update_row(erow *row)
 	row->rsize = idx;
 }
 
-static void editor_append_row(const char *s, size_t len)
+static void editor_insert_row(int at, const char *s, size_t len)
 {
-	erow *grown = realloc(E.row, sizeof(erow) * (E.numrows + 1));
-	erow *row;
+	erow *grown;
 
+	if (at < 0 || at > E.numrows)
+		return;
+
+	grown = realloc(E.row, sizeof(erow) * (E.numrows + 1));
 	if (grown == NULL)
 		die("realloc");
 	E.row = grown;
 
-	row = &E.row[E.numrows];
-	row->size = (int)len;
-	row->chars = malloc(len + 1);
-	if (row->chars == NULL)
-		die("malloc");
-	memcpy(row->chars, s, len);
-	row->chars[len] = '\0';
+	/* Open a gap at `at` by sliding everything below it down one slot. */
+	memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
-	row->rsize = 0;
-	row->render = NULL;
-	editor_update_row(row);
+	E.row[at].size = (int)len;
+	E.row[at].chars = malloc(len + 1);
+	if (E.row[at].chars == NULL)
+		die("malloc");
+	memcpy(E.row[at].chars, s, len);
+	E.row[at].chars[len] = '\0';
+
+	E.row[at].rsize = 0;
+	E.row[at].render = NULL;
+	editor_update_row(&E.row[at]);
 
 	E.numrows++;
+	E.dirty++;
+}
+
+static void editor_free_row(erow *row)
+{
+	free(row->render);
+	free(row->chars);
+}
+
+static void editor_del_row(int at)
+{
+	if (at < 0 || at >= E.numrows)
+		return;
+
+	editor_free_row(&E.row[at]);
+	memmove(&E.row[at], &E.row[at + 1],
+		sizeof(erow) * (E.numrows - at - 1));
+	E.numrows--;
+	E.dirty++;
+}
+
+static void editor_row_insert_char(erow *row, int at, int c)
+{
+	char *grown;
+
+	if (at < 0 || at > row->size)
+		at = row->size;
+
+	/* One byte for the character, one for the terminator. */
+	grown = realloc(row->chars, row->size + 2);
+	if (grown == NULL)
+		die("realloc");
+	row->chars = grown;
+
+	/* +1 on the length carries the terminator along with the tail. */
+	memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+	row->size++;
+	row->chars[at] = (char)c;
+
+	editor_update_row(row);
+	E.dirty++;
+}
+
+static void editor_row_del_char(erow *row, int at)
+{
+	if (at < 0 || at >= row->size)
+		return;
+
+	memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+	row->size--;
+
+	editor_update_row(row);
+	E.dirty++;
+}
+
+static void editor_row_append_string(erow *row, const char *s, size_t len)
+{
+	char *grown = realloc(row->chars, row->size + len + 1);
+
+	if (grown == NULL)
+		die("realloc");
+	row->chars = grown;
+
+	memcpy(&row->chars[row->size], s, len);
+	row->size += (int)len;
+	row->chars[row->size] = '\0';
+
+	editor_update_row(row);
+	E.dirty++;
+}
+
+/* ---------- editor operations ---------- */
+
+static void editor_insert_char(int c)
+{
+	/* Typing on the virtual line past the end of the file brings it into
+	   existence first. */
+	if (E.cy == E.numrows)
+		editor_insert_row(E.numrows, "", 0);
+
+	editor_row_insert_char(&E.row[E.cy], E.cx, c);
+	E.cx++;
+}
+
+static void editor_insert_newline(void)
+{
+	if (E.cx == 0) {
+		/* At the start of a line, push a blank one above instead of
+		   splitting anything. */
+		editor_insert_row(E.cy, "", 0);
+	} else {
+		erow *row = &E.row[E.cy];
+
+		/* Everything right of the cursor moves down to a new line. */
+		editor_insert_row(E.cy + 1, &row->chars[E.cx],
+				  (size_t)(row->size - E.cx));
+
+		/* That insert reallocs E.row, so the old pointer may now be
+		   dangling. Look the row up again before truncating it. */
+		row = &E.row[E.cy];
+		row->size = E.cx;
+		row->chars[row->size] = '\0';
+		editor_update_row(row);
+	}
+
+	E.cy++;
+	E.cx = 0;
+}
+
+static void editor_del_char(void)
+{
+	erow *row;
+
+	if (E.cy == E.numrows)
+		return;
+	if (E.cx == 0 && E.cy == 0)
+		return;
+
+	row = &E.row[E.cy];
+	if (E.cx > 0) {
+		editor_row_del_char(row, E.cx - 1);
+		E.cx--;
+	} else {
+		/* Backspace in column 0 joins this line onto the end of the
+		   one above, so the cursor lands where the join happened. */
+		E.cx = E.row[E.cy - 1].size;
+		editor_row_append_string(&E.row[E.cy - 1], row->chars,
+					 (size_t)row->size);
+		editor_del_row(E.cy);
+		E.cy--;
+	}
 }
 
 /* ---------- file i/o ---------- */
+
+static char *editor_rows_to_string(int *buflen)
+{
+	int totlen = 0;
+	int j;
+	char *buf;
+	char *p;
+
+	for (j = 0; j < E.numrows; j++)
+		totlen += E.row[j].size + 1;	/* room for the newline */
+	*buflen = totlen;
+
+	/* malloc(0) is allowed to hand back NULL, which would look like an
+	   allocation failure, so never ask for nothing. */
+	buf = malloc(totlen == 0 ? 1 : (size_t)totlen);
+	if (buf == NULL)
+		die("malloc");
+
+	p = buf;
+	for (j = 0; j < E.numrows; j++) {
+		memcpy(p, E.row[j].chars, E.row[j].size);
+		p += E.row[j].size;
+		*p++ = '\n';
+	}
+
+	return buf;
+}
 
 static void editor_open(const char *filename)
 {
@@ -254,8 +433,13 @@ static void editor_open(const char *filename)
 		die("strdup");
 
 	fp = fopen(filename, "r");
-	if (fp == NULL)
+	if (fp == NULL) {
+		/* A name that is not on disk yet just means a new file: start
+		   from an empty buffer and let the first save create it. */
+		if (errno == ENOENT)
+			return;
 		die("fopen");
+	}
 
 	while ((linelen = getline(&line, &linecap, fp)) != -1) {
 		/* getline hands back the newline as well. Strip it, and a
@@ -264,11 +448,56 @@ static void editor_open(const char *filename)
 		while (linelen > 0 && (line[linelen - 1] == '\n' ||
 				       line[linelen - 1] == '\r'))
 			linelen--;
-		editor_append_row(line, (size_t)linelen);
+		editor_insert_row(E.numrows, line, (size_t)linelen);
 	}
 
 	free(line);
 	fclose(fp);
+
+	/* Loading a file is not an edit. */
+	E.dirty = 0;
+}
+
+static void editor_save(void)
+{
+	int len;
+	int fd;
+	char *buf;
+	const char *problem = NULL;
+
+	if (E.filename == NULL) {
+		editor_set_status_message("No file name - start ced with one");
+		return;
+	}
+
+	buf = editor_rows_to_string(&len);
+
+	/* Truncating in place keeps the same inode, so permissions, hard links
+	   and symlinks all survive the save. The trade-off is a window where
+	   the file on disk is short: a crash between ftruncate and write loses
+	   data. Writing a temp file and renaming it closes that window, but
+	   replaces a symlink with a regular file and needs the same
+	   filesystem, so this keeps the simpler behaviour. */
+	fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+	if (fd == -1) {
+		problem = strerror(errno);
+	} else {
+		if (ftruncate(fd, len) == -1)
+			problem = strerror(errno);
+		else if (write(fd, buf, (size_t)len) != len)
+			problem = strerror(errno);
+		close(fd);
+	}
+
+	free(buf);
+
+	if (problem != NULL) {
+		editor_set_status_message("Can't save: %s", problem);
+		return;
+	}
+
+	E.dirty = 0;
+	editor_set_status_message("%d bytes written to disk", len);
 }
 
 /* ---------- append buffer ----------
@@ -331,9 +560,12 @@ static void editor_draw_rows(struct abuf *ab)
 		int filerow = y + E.rowoff;
 
 		if (filerow >= E.numrows) {
-			/* The greeting would just be in the way of a real file,
-			   so it only appears when nothing was opened. */
-			if (E.numrows == 0 && y == E.screenrows / 3) {
+			/* The greeting is only for a session that was handed
+			   nothing at all. Naming a file means there is a file,
+			   even an empty or brand new one, and a version banner
+			   sitting in the text area would read as content. */
+			if (E.numrows == 0 && E.filename == NULL &&
+			    y == E.screenrows / 3) {
 				char welcome[80];
 				int len = snprintf(welcome, sizeof(welcome),
 						   "ced -- version %s",
@@ -373,12 +605,22 @@ static void editor_draw_rows(struct abuf *ab)
 		/* Erase whatever used to be on the rest of this line. Cheaper
 		   and flicker-free compared to clearing the whole screen. */
 		ab_append(ab, "\x1b[K", 3);
-
-		/* No newline after the last row, or the terminal scrolls and
-		   the top line disappears. */
-		if (y < E.screenrows - 1)
-			ab_append(ab, "\r\n", 2);
+		ab_append(ab, "\r\n", 2);
 	}
+}
+
+static void editor_draw_message_bar(struct abuf *ab)
+{
+	int len = (int)strlen(E.statusmsg);
+
+	ab_append(ab, "\x1b[K", 3);
+
+	if (len > E.screencols)
+		len = E.screencols;
+	/* Messages time out so the bar stops advertising something that
+	   happened a long time ago. */
+	if (len > 0 && time(NULL) - E.statusmsg_time < 5)
+		ab_append(ab, E.statusmsg, len);
 }
 
 static void editor_refresh_screen(void)
@@ -392,6 +634,7 @@ static void editor_refresh_screen(void)
 	ab_append(&ab, "\x1b[H", 3);		/* move to row 1, col 1 */
 
 	editor_draw_rows(&ab);
+	editor_draw_message_bar(&ab);
 
 	/* Escape sequences count from 1, and the cursor is positioned in
 	   screen space, so the scroll offsets have to come back off. */
@@ -404,6 +647,17 @@ static void editor_refresh_screen(void)
 	if (write(STDOUT_FILENO, ab.b, ab.len) == -1)
 		die("write");
 	ab_free(&ab);
+}
+
+static void editor_set_status_message(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+	va_end(ap);
+
+	E.statusmsg_time = time(NULL);
 }
 
 /* ---------- input ---------- */
@@ -515,13 +769,31 @@ static void editor_move_cursor(int key)
 
 static void editor_process_keypress(void)
 {
+	static int quit_times = CED_QUIT_TIMES;
 	int c = editor_read_key();
 
 	switch (c) {
+	case '\r':
+		editor_insert_newline();
+		break;
+
 	case CTRL_KEY('q'):
+		if (E.dirty > 0 && quit_times > 0) {
+			editor_set_status_message(
+				"%d unsaved change%s. Press Ctrl-Q %d more "
+				"time%s to quit anyway.",
+				E.dirty, E.dirty == 1 ? "" : "s",
+				quit_times, quit_times == 1 ? "" : "s");
+			quit_times--;
+			return;
+		}
 		(void)!write(STDOUT_FILENO, "\x1b[2J", 4);
 		(void)!write(STDOUT_FILENO, "\x1b[H", 3);
 		exit(0);
+
+	case CTRL_KEY('s'):
+		editor_save();
+		break;
 
 	case HOME_KEY:
 		E.cx = 0;
@@ -530,6 +802,17 @@ static void editor_process_keypress(void)
 	case END_KEY:
 		if (E.cy < E.numrows)
 			E.cx = E.row[E.cy].size;
+		break;
+
+	case BACKSPACE:
+	case CTRL_KEY('h'):	/* what Backspace sent before 127 won out */
+		editor_del_char();
+		break;
+
+	case DEL_KEY:
+		/* Forward delete is a backspace from one place to the right. */
+		editor_move_cursor(ARROW_RIGHT);
+		editor_del_char();
 		break;
 
 	case PAGE_UP:
@@ -559,7 +842,22 @@ static void editor_process_keypress(void)
 	case ARROW_RIGHT:
 		editor_move_cursor(c);
 		break;
+
+	case CTRL_KEY('l'):	/* redraw: every loop already does one */
+	case '\x1b':
+		break;
+
+	default:
+		/* Control codes we have not claimed would show up as garbage,
+		   so only printable bytes get inserted. Bytes above 127 are
+		   kept so UTF-8 text at least survives a round trip, even
+		   though the column maths still counts them one per byte. */
+		if (!iscntrl(c))
+			editor_insert_char(c);
+		break;
 	}
+
+	quit_times = CED_QUIT_TIMES;
 }
 
 /* ---------- init ---------- */
@@ -573,10 +871,16 @@ static void init_editor(void)
 	E.coloff = 0;
 	E.numrows = 0;
 	E.row = NULL;
+	E.dirty = 0;
 	E.filename = NULL;
+	E.statusmsg[0] = '\0';
+	E.statusmsg_time = 0;
 
 	if (get_window_size(&E.screenrows, &E.screencols) == -1)
 		die("get_window_size");
+
+	/* The bottom line belongs to the message bar. */
+	E.screenrows -= 1;
 }
 
 int main(int argc, char *argv[])
@@ -585,6 +889,8 @@ int main(int argc, char *argv[])
 	init_editor();
 	if (argc >= 2)
 		editor_open(argv[1]);
+
+	editor_set_status_message("Ctrl-S = save | Ctrl-Q = quit");
 
 	for (;;) {
 		editor_refresh_screen();

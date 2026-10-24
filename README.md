@@ -20,12 +20,33 @@ the first save.
 
 ## Keys
 
+Starts in normal mode, like vim.
+
 ```
-arrows, home/end, pgup/pgdn   move around
-enter, backspace, delete      edit
-ctrl-s                        save
-ctrl-q                        quit — four presses if there are unsaved edits
+normal mode
+  h j k l            move
+  w b                word forward / back
+  0 $                line start / end
+  gg G               file start / end
+  i a I A            insert at cursor / after it / line start / line end
+  o O                open a line below / above
+  x dd               delete a character / a line
+  / n N              search, next match, previous match
+  :w :q :q! :wq      save, quit, quit anyway, save and quit
+  esc                leave insert mode
+
+either mode
+  arrows             move
+  home end           line start / end
+  pgup pgdn          move a screenful
+  enter              split the line        (insert mode)
+  backspace delete   delete                (insert mode)
+  ctrl-s             save
+  ctrl-f             search
+  ctrl-q             quit — four presses if there are unsaved edits
 ```
+
+Saving a buffer that has no filename prompts for one.
 
 ## Implementation notes
 
@@ -47,8 +68,16 @@ unchanged. The cost is a crash window between `ftruncate` and `write`.
 Every line is written with a trailing newline, and CRs are stripped on load,
 so a CRLF file saves back as LF.
 
+Search, `:` commands and the save-as prompt all run through one function that
+reads a line on the message bar. It takes an optional callback that fires on
+every keystroke, which is the whole trick behind search jumping as you type —
+the callback moves the cursor, and ESC puts it back where it started.
+
 ## Not done yet
 
-- status bar, incremental search, vim normal/insert modes
 - syntax highlighting for C
 - SIGWINCH — resizing the terminal mid-session doesn't re-measure
+- search only finds the first match on a line, so `n` steps line by line
+- normal mode lets the cursor sit one past the last character; vim clamps it
+- scrolled right on a long line, stepping onto a short one scrolls the window
+  to the cursor and leaves that line off to the left

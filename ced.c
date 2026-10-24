@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CED_VERSION "0.3.0"
+#define CED_VERSION "0.4.0"
 #define CED_TAB_STOP 8
 
 /* How many extra times Ctrl-Q has to be pressed to throw away unsaved work. */
@@ -42,6 +42,11 @@ enum editor_key {
 	PAGE_DOWN
 };
 
+enum editor_mode {
+	MODE_NORMAL,
+	MODE_INSERT
+};
+
 /* One line of the file.
  *
  * `chars` is exactly what sits on disk. `render` is the same line with tabs
@@ -61,12 +66,15 @@ struct editor_config {
 	int rx;			/* cursor column once tabs are expanded */
 	int rowoff;		/* first file row visible on screen */
 	int coloff;		/* first render column visible on screen */
-	int screenrows;		/* text rows, excluding the message bar */
+	int screenrows;		/* text rows, excluding status and message bars */
 	int screencols;
 	int numrows;
 	erow *row;
 	int dirty;		/* edits made since the last save */
+	int mode;
+	int pending;		/* first key of a two-key command like dd */
 	char *filename;
+	char *last_query;	/* what n and N search for */
 	char statusmsg[80];
 	time_t statusmsg_time;
 	struct termios orig_termios;
@@ -74,11 +82,23 @@ struct editor_config {
 
 static struct editor_config E;
 
-/* Lives down in the output section, but the save path needs to report with
-   it. */
+/* All defined further down, but needed earlier: saving prompts for a file
+   name when there isn't one, and the prompt has to redraw and read keys
+   while it runs. */
 static void editor_set_status_message(const char *fmt, ...);
+static void editor_refresh_screen(void);
+static int editor_read_key(void);
+static char *editor_prompt(const char *prompt, void (*callback)(char *, int));
+static void editor_move_cursor(int key);
 
 /* ---------- terminal ---------- */
+
+static void editor_exit(void)
+{
+	(void)!write(STDOUT_FILENO, "\x1b[2J", 4);
+	(void)!write(STDOUT_FILENO, "\x1b[H", 3);
+	exit(0);
+}
 
 static void die(const char *msg)
 {
@@ -391,6 +411,76 @@ static void editor_del_char(void)
 	}
 }
 
+/* Delete the character sitting under the cursor - vim's x. */
+static void editor_del_char_forward(void)
+{
+	erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
+	if (row == NULL || E.cx >= row->size)
+		return;
+
+	editor_row_del_char(row, E.cx);
+	if (E.cx > row->size)
+		E.cx = row->size;
+}
+
+/* Delete the whole line - vim's dd. */
+static void editor_del_current_row(void)
+{
+	if (E.cy >= E.numrows)
+		return;
+
+	editor_del_row(E.cy);
+	if (E.cy >= E.numrows && E.cy > 0)
+		E.cy--;
+	E.cx = 0;
+}
+
+static int is_word_char(int c)
+{
+	return isalnum(c) || c == '_';
+}
+
+static void editor_move_word_forward(void)
+{
+	erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
+	if (row == NULL)
+		return;
+
+	/* Step off whatever word we are in, then across the gap after it. */
+	while (E.cx < row->size &&
+	       is_word_char((unsigned char)row->chars[E.cx]))
+		E.cx++;
+	while (E.cx < row->size &&
+	       !is_word_char((unsigned char)row->chars[E.cx]))
+		E.cx++;
+
+	/* Ran off the end, so carry on from the start of the next line. */
+	if (E.cx >= row->size && E.cy < E.numrows - 1) {
+		E.cy++;
+		E.cx = 0;
+	}
+}
+
+static void editor_move_word_back(void)
+{
+	erow *row;
+
+	if (E.cx == 0) {
+		if (E.cy == 0)
+			return;
+		E.cy--;
+		E.cx = E.row[E.cy].size;
+	}
+
+	row = &E.row[E.cy];
+	while (E.cx > 0 && !is_word_char((unsigned char)row->chars[E.cx - 1]))
+		E.cx--;
+	while (E.cx > 0 && is_word_char((unsigned char)row->chars[E.cx - 1]))
+		E.cx--;
+}
+
 /* ---------- file i/o ---------- */
 
 static char *editor_rows_to_string(int *buflen)
@@ -466,8 +556,11 @@ static void editor_save(void)
 	const char *problem = NULL;
 
 	if (E.filename == NULL) {
-		editor_set_status_message("No file name - start ced with one");
-		return;
+		E.filename = editor_prompt("Save as: %s (ESC cancels)", NULL);
+		if (E.filename == NULL) {
+			editor_set_status_message("Save cancelled");
+			return;
+		}
 	}
 
 	buf = editor_rows_to_string(&len);
@@ -498,6 +591,135 @@ static void editor_save(void)
 
 	E.dirty = 0;
 	editor_set_status_message("%d bytes written to disk", len);
+}
+
+/* ---------- search ---------- */
+
+/* Jump to the next line matching `query`, starting one line off from where
+   the cursor is. Only the first hit on a line is found, which is enough for
+   stepping through a file. */
+static int editor_search_from(const char *query, int from, int direction)
+{
+	int current = from;
+	int i;
+
+	if (E.numrows == 0)
+		return 0;
+
+	for (i = 0; i < E.numrows; i++) {
+		char *match;
+
+		current += direction;
+		if (current == -1)
+			current = E.numrows - 1;
+		else if (current == E.numrows)
+			current = 0;
+
+		match = strstr(E.row[current].chars, query);
+		if (match != NULL) {
+			E.cy = current;
+			E.cx = (int)(match - E.row[current].chars);
+			/* Shove rowoff past the end so the next scroll() pass
+			   brings the match onto the screen. */
+			E.rowoff = E.numrows;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void editor_find_callback(char *query, int key)
+{
+	static int last_match = -1;
+	static int direction = 1;
+
+	if (key == '\r' || key == '\x1b') {
+		last_match = -1;
+		direction = 1;
+		return;
+	} else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+		direction = 1;
+	} else if (key == ARROW_LEFT || key == ARROW_UP) {
+		direction = -1;
+	} else {
+		/* The query changed, so start over from the top. */
+		last_match = -1;
+		direction = 1;
+	}
+
+	if (last_match == -1)
+		direction = 1;
+
+	if (query[0] == '\0')
+		return;
+
+	if (editor_search_from(query, last_match, direction))
+		last_match = E.cy;
+}
+
+static void editor_find(void)
+{
+	int saved_cx = E.cx;
+	int saved_cy = E.cy;
+	int saved_coloff = E.coloff;
+	int saved_rowoff = E.rowoff;
+	char *query;
+
+	query = editor_prompt("Search: %s (arrows to step, ESC cancels)",
+			      editor_find_callback);
+
+	if (query != NULL) {
+		free(E.last_query);
+		E.last_query = query;		/* kept for n and N */
+	} else {
+		/* Cancelled, so put the view back exactly as it was. */
+		E.cx = saved_cx;
+		E.cy = saved_cy;
+		E.coloff = saved_coloff;
+		E.rowoff = saved_rowoff;
+	}
+}
+
+static void editor_find_next(int direction)
+{
+	if (E.last_query == NULL) {
+		editor_set_status_message("No previous search");
+		return;
+	}
+
+	if (!editor_search_from(E.last_query, E.cy, direction))
+		editor_set_status_message("Not found: %s", E.last_query);
+}
+
+/* ---------- ex commands ---------- */
+
+static void editor_run_command(void)
+{
+	char *cmd = editor_prompt(":%s", NULL);
+
+	if (cmd == NULL)
+		return;
+
+	if (strcmp(cmd, "w") == 0) {
+		editor_save();
+	} else if (strcmp(cmd, "q") == 0) {
+		if (E.dirty > 0)
+			editor_set_status_message(
+				"Unsaved changes - :q! discards them");
+		else
+			editor_exit();
+	} else if (strcmp(cmd, "q!") == 0) {
+		editor_exit();
+	} else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "x") == 0) {
+		editor_save();
+		if (E.dirty == 0)
+			editor_exit();
+	} else {
+		editor_set_status_message("Not a command: :%s", cmd);
+	}
+
+	free(cmd);
 }
 
 /* ---------- append buffer ----------
@@ -609,6 +831,43 @@ static void editor_draw_rows(struct abuf *ab)
 	}
 }
 
+static void editor_draw_status_bar(struct abuf *ab)
+{
+	char left[128];
+	char right[32];
+	int llen, rlen;
+
+	ab_append(ab, "\x1b[7m", 4);		/* swap foreground and back */
+
+	llen = snprintf(left, sizeof(left), "%.40s%s  %s",
+			E.filename != NULL ? E.filename : "[no name]",
+			E.dirty > 0 ? " [+]" : "",
+			E.mode == MODE_INSERT ? "-- INSERT --" : "-- NORMAL --");
+	rlen = snprintf(right, sizeof(right), "%d/%d", E.cy + 1, E.numrows);
+
+	if (llen < 0)
+		llen = 0;
+	if (rlen < 0)
+		rlen = 0;
+	if (llen > E.screencols)
+		llen = E.screencols;
+	ab_append(ab, left, llen);
+
+	while (llen < E.screencols) {
+		/* Pad with spaces, dropping the position in once it lines up
+		   with the right-hand edge. */
+		if (E.screencols - llen == rlen) {
+			ab_append(ab, right, rlen);
+			break;
+		}
+		ab_append(ab, " ", 1);
+		llen++;
+	}
+
+	ab_append(ab, "\x1b[m", 3);		/* back to normal video */
+	ab_append(ab, "\r\n", 2);
+}
+
 static void editor_draw_message_bar(struct abuf *ab)
 {
 	int len = (int)strlen(E.statusmsg);
@@ -634,6 +893,7 @@ static void editor_refresh_screen(void)
 	ab_append(&ab, "\x1b[H", 3);		/* move to row 1, col 1 */
 
 	editor_draw_rows(&ab);
+	editor_draw_status_bar(&ab);
 	editor_draw_message_bar(&ab);
 
 	/* Escape sequences count from 1, and the cursor is positioned in
@@ -723,6 +983,65 @@ static int editor_read_key(void)
 	return '\x1b';
 }
 
+/* Read a line from the user on the message bar.
+ *
+ * `prompt` is a format string with one %s in it, which is where the text so
+ * far gets shown. If `callback` is given it runs after every keystroke, which
+ * is what makes search update as you type. Returns NULL if cancelled; the
+ * caller owns the string otherwise. */
+static char *editor_prompt(const char *prompt, void (*callback)(char *, int))
+{
+	size_t bufsize = 128;
+	size_t buflen = 0;
+	char *buf = malloc(bufsize);
+
+	if (buf == NULL)
+		die("malloc");
+	buf[0] = '\0';
+
+	for (;;) {
+		int c;
+
+		editor_set_status_message(prompt, buf);
+		editor_refresh_screen();
+
+		c = editor_read_key();
+
+		if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+			if (buflen != 0)
+				buf[--buflen] = '\0';
+		} else if (c == '\x1b') {
+			editor_set_status_message("");
+			if (callback != NULL)
+				callback(buf, c);
+			free(buf);
+			return NULL;
+		} else if (c == '\r') {
+			if (buflen != 0) {
+				editor_set_status_message("");
+				if (callback != NULL)
+					callback(buf, c);
+				return buf;
+			}
+		} else if (!iscntrl(c) && c < 1000) {
+			if (buflen == bufsize - 1) {
+				char *grown;
+
+				bufsize *= 2;
+				grown = realloc(buf, bufsize);
+				if (grown == NULL)
+					die("realloc");
+				buf = grown;
+			}
+			buf[buflen++] = (char)c;
+			buf[buflen] = '\0';
+		}
+
+		if (callback != NULL)
+			callback(buf, c);
+	}
+}
+
 static void editor_move_cursor(int key)
 {
 	/* Sitting one line past the end of the file is legal, and there is no
@@ -767,41 +1086,75 @@ static void editor_move_cursor(int key)
 		E.cx = rowlen;
 }
 
-static void editor_process_keypress(void)
+static void editor_page(int key)
 {
-	static int quit_times = CED_QUIT_TIMES;
-	int c = editor_read_key();
+	int times = E.screenrows;
 
+	/* Park the cursor at the top or bottom of the current view first, then
+	   walk a whole screen from there. Going through the arrow logic keeps
+	   the end-of-line clamping consistent. */
+	if (key == PAGE_UP) {
+		E.cy = E.rowoff;
+	} else {
+		E.cy = E.rowoff + E.screenrows - 1;
+		if (E.cy > E.numrows)
+			E.cy = E.numrows;
+	}
+
+	while (times-- > 0)
+		editor_move_cursor(key == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+}
+
+/* Keys that mean the same thing whichever mode we are in. Returns 1 if the
+   key was dealt with here. */
+static int editor_handle_common_key(int c)
+{
 	switch (c) {
-	case '\r':
-		editor_insert_newline();
-		break;
-
-	case CTRL_KEY('q'):
-		if (E.dirty > 0 && quit_times > 0) {
-			editor_set_status_message(
-				"%d unsaved change%s. Press Ctrl-Q %d more "
-				"time%s to quit anyway.",
-				E.dirty, E.dirty == 1 ? "" : "s",
-				quit_times, quit_times == 1 ? "" : "s");
-			quit_times--;
-			return;
-		}
-		(void)!write(STDOUT_FILENO, "\x1b[2J", 4);
-		(void)!write(STDOUT_FILENO, "\x1b[H", 3);
-		exit(0);
-
 	case CTRL_KEY('s'):
 		editor_save();
-		break;
+		return 1;
+
+	case CTRL_KEY('f'):
+		editor_find();
+		return 1;
+
+	case ARROW_UP:
+	case ARROW_DOWN:
+	case ARROW_LEFT:
+	case ARROW_RIGHT:
+		editor_move_cursor(c);
+		return 1;
 
 	case HOME_KEY:
 		E.cx = 0;
-		break;
+		return 1;
 
 	case END_KEY:
 		if (E.cy < E.numrows)
 			E.cx = E.row[E.cy].size;
+		return 1;
+
+	case PAGE_UP:
+	case PAGE_DOWN:
+		editor_page(c);
+		return 1;
+
+	case CTRL_KEY('l'):	/* redraw: the main loop already does one */
+		return 1;
+	}
+
+	return 0;
+}
+
+static void editor_process_insert_key(int c)
+{
+	switch (c) {
+	case '\x1b':
+		E.mode = MODE_NORMAL;
+		break;
+
+	case '\r':
+		editor_insert_newline();
 		break;
 
 	case BACKSPACE:
@@ -815,38 +1168,6 @@ static void editor_process_keypress(void)
 		editor_del_char();
 		break;
 
-	case PAGE_UP:
-	case PAGE_DOWN: {
-		int times = E.screenrows;
-
-		/* Park the cursor at the top or bottom of the current view
-		   first, then walk a whole screen from there. Going through the
-		   arrow logic keeps the end-of-line clamping consistent. */
-		if (c == PAGE_UP) {
-			E.cy = E.rowoff;
-		} else {
-			E.cy = E.rowoff + E.screenrows - 1;
-			if (E.cy > E.numrows)
-				E.cy = E.numrows;
-		}
-
-		while (times-- > 0)
-			editor_move_cursor(c == PAGE_UP ? ARROW_UP
-							: ARROW_DOWN);
-		break;
-	}
-
-	case ARROW_UP:
-	case ARROW_DOWN:
-	case ARROW_LEFT:
-	case ARROW_RIGHT:
-		editor_move_cursor(c);
-		break;
-
-	case CTRL_KEY('l'):	/* redraw: every loop already does one */
-	case '\x1b':
-		break;
-
 	default:
 		/* Control codes we have not claimed would show up as garbage,
 		   so only printable bytes get inserted. Bytes above 127 are
@@ -855,6 +1176,128 @@ static void editor_process_keypress(void)
 		if (!iscntrl(c))
 			editor_insert_char(c);
 		break;
+	}
+}
+
+static void editor_process_normal_key(int c)
+{
+	/* g and d both need a second keystroke before they mean anything. */
+	if (E.pending != 0) {
+		int first = E.pending;
+
+		E.pending = 0;
+		if (first == 'g' && c == 'g') {
+			E.cy = 0;
+			E.cx = 0;
+		} else if (first == 'd' && c == 'd') {
+			editor_del_current_row();
+		}
+		return;
+	}
+
+	switch (c) {
+	case 'h': editor_move_cursor(ARROW_LEFT); break;
+	case 'j': editor_move_cursor(ARROW_DOWN); break;
+	case 'k': editor_move_cursor(ARROW_UP); break;
+	case 'l': editor_move_cursor(ARROW_RIGHT); break;
+
+	case '0':
+		E.cx = 0;
+		break;
+	case '$':
+		if (E.cy < E.numrows)
+			E.cx = E.row[E.cy].size;
+		break;
+
+	case 'g':
+	case 'd':
+		E.pending = c;
+		break;
+
+	case 'G':
+		E.cy = E.numrows > 0 ? E.numrows - 1 : 0;
+		E.cx = 0;
+		break;
+
+	case 'w': editor_move_word_forward(); break;
+	case 'b': editor_move_word_back(); break;
+
+	case 'x': editor_del_char_forward(); break;
+
+	case 'i':
+		E.mode = MODE_INSERT;
+		break;
+	case 'a':
+		if (E.cy < E.numrows && E.cx < E.row[E.cy].size)
+			E.cx++;
+		E.mode = MODE_INSERT;
+		break;
+	case 'I':
+		E.cx = 0;
+		E.mode = MODE_INSERT;
+		break;
+	case 'A':
+		if (E.cy < E.numrows)
+			E.cx = E.row[E.cy].size;
+		E.mode = MODE_INSERT;
+		break;
+	case 'o':
+		/* Splitting at the end of a line leaves a blank one below it
+		   with the cursor already there. */
+		if (E.cy < E.numrows)
+			E.cx = E.row[E.cy].size;
+		editor_insert_newline();
+		E.mode = MODE_INSERT;
+		break;
+	case 'O':
+		/* Splitting at column 0 pushes a blank line above, and leaves
+		   the cursor on the original line, so step back up onto it. */
+		E.cx = 0;
+		editor_insert_newline();
+		if (E.cy > 0)
+			E.cy--;
+		E.mode = MODE_INSERT;
+		break;
+
+	case '/': editor_find(); break;
+	case 'n': editor_find_next(1); break;
+	case 'N': editor_find_next(-1); break;
+
+	case ':': editor_run_command(); break;
+
+	case BACKSPACE:
+		editor_move_cursor(ARROW_LEFT);
+		break;
+	}
+}
+
+static void editor_process_keypress(void)
+{
+	static int quit_times = CED_QUIT_TIMES;
+	int c = editor_read_key();
+
+	/* Ctrl-Q is the only key that cares about its own repeat count, so it
+	   returns early and skips the reset at the bottom. */
+	if (c == CTRL_KEY('q')) {
+		if (E.dirty > 0 && quit_times > 0) {
+			editor_set_status_message(
+				"%d unsaved change%s. Press Ctrl-Q %d more "
+				"time%s to quit anyway.",
+				E.dirty, E.dirty == 1 ? "" : "s",
+				quit_times, quit_times == 1 ? "" : "s");
+			quit_times--;
+			return;
+		}
+		editor_exit();
+	}
+
+	if (editor_handle_common_key(c)) {
+		/* A shared key in the middle of dd or gg abandons it. */
+		E.pending = 0;
+	} else if (E.mode == MODE_INSERT) {
+		editor_process_insert_key(c);
+	} else {
+		editor_process_normal_key(c);
 	}
 
 	quit_times = CED_QUIT_TIMES;
@@ -872,15 +1315,18 @@ static void init_editor(void)
 	E.numrows = 0;
 	E.row = NULL;
 	E.dirty = 0;
+	E.mode = MODE_NORMAL;
+	E.pending = 0;
 	E.filename = NULL;
+	E.last_query = NULL;
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
 
 	if (get_window_size(&E.screenrows, &E.screencols) == -1)
 		die("get_window_size");
 
-	/* The bottom line belongs to the message bar. */
-	E.screenrows -= 1;
+	/* The bottom two lines are the status bar and the message bar. */
+	E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[])
@@ -890,7 +1336,8 @@ int main(int argc, char *argv[])
 	if (argc >= 2)
 		editor_open(argv[1]);
 
-	editor_set_status_message("Ctrl-S = save | Ctrl-Q = quit");
+	editor_set_status_message(
+		"i = insert | ESC = normal | / = search | :w :q | Ctrl-S Ctrl-Q");
 
 	for (;;) {
 		editor_refresh_screen();

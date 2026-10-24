@@ -1,0 +1,5 @@
+ced
+*.o
+*.d
+core
+*.dSYM/

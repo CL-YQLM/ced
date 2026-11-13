@@ -1,8 +1,11 @@
-/* ced - a terminal text editor written from scratch.
+/* ced - a terminal text editor.
  *
  * There is no curses layer here. Keyboard input comes straight off the
  * terminal in raw mode (termios), and the screen is drawn by printing VT100
  * escape sequences.
+ *
+ * The buffer and screen layer started from antirez's kilo. The modal
+ * editing, the motions, the : commands and n/N are mine; see the README.
  */
 
 #include <ctype.h>

@@ -1,10 +1,18 @@
 # ced
 
-Terminal text editor written from scratch in C. No ncurses: raw `termios`
-for keyboard input, VT100 escape sequences for drawing.
+Terminal text editor in C. No ncurses: raw `termios` for keyboard input,
+VT100 escape sequences for drawing.
 
 Honors project. I live in vim and nano and wanted to know what's actually
 going on underneath.
+
+The buffer and screen layer started from antirez's kilo, by way of the
+snaptoken *Build Your Own Text Editor* tutorial. What makes this behave
+like vim rather than like nano is mine: normal and insert modes, the
+pending-key state machine behind `dd` and `gg`, the motions, the `:`
+commands, and `n`/`N`, which kilo cannot do at all because it throws the
+query away the moment the prompt closes. The pty suites under `tests/` are
+mine as well; the tutorial ships none.
 
 ## Build
 
@@ -86,6 +94,12 @@ Search, `:` commands and the save-as prompt all run through one function that
 reads a line on the message bar. It takes an optional callback that fires on
 every keystroke, which is the whole trick behind search jumping as you type:
 the callback moves the cursor, and ESC puts it back where it started.
+
+That is where kilo stops. Making `n` and `N` work means the query has to
+outlive the prompt, so it gets kept in `last_query`, and the match highlight
+then has to come back off without having stashed a copy of the row's colours
+first. That is what `match_row` and a re-run of the highlighter are for: the
+colours are derived from the row, so they can just be recomputed.
 
 Highlighting stores one colour code per byte of `render`, not of `chars`,
 because that's what gets drawn. Block comments are the awkward part: whether

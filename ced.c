@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CED_VERSION "0.5.0"
+#define CED_VERSION "0.1"
 #define CED_TAB_STOP 8
 
 /* How many extra times Ctrl-Q has to be pressed to throw away unsaved work. */

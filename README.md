@@ -18,6 +18,20 @@ make
 A filename that doesn't exist yet opens an empty buffer and gets created on
 the first save.
 
+## Tests
+
+The suites drive ced on a real pty and read the frames back off it, so they
+need python3 as well.
+
+```sh
+make test        # behaviour, then highlighting
+make test-asan   # the memory paths, under ASan and UBSan
+```
+
+Run test-asan from a native filesystem. LeakSanitizer cannot symbolize a
+binary on a mounted Windows drive, and it hangs printing DEADLYSIGNAL
+rather than saying so.
+
 ## Keys
 
 Starts in normal mode, like vim.

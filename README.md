@@ -1,6 +1,6 @@
 # ced
 
-Terminal text editor written from scratch in C. No ncurses — raw `termios`
+Terminal text editor written from scratch in C. No ncurses: raw `termios`
 for keyboard input, VT100 escape sequences for drawing.
 
 Honors project. I live in vim and nano and wanted to know what's actually
@@ -43,7 +43,7 @@ either mode
   backspace delete   delete                (insert mode)
   ctrl-s             save
   ctrl-f             search
-  ctrl-q             quit — four presses if there are unsaved edits
+  ctrl-q             quit (four presses if there are unsaved edits)
 ```
 
 Saving a buffer that has no filename prompts for one.
@@ -52,7 +52,7 @@ Saving a buffer that has no filename prompts for one.
 
 Every line is kept twice: `chars` is the bytes on disk, `render` is the same
 line with tabs expanded to 8-column stops. That's why the cursor needs two
-column numbers — `cx` indexes `chars`, `rx` indexes `render`, and the two
+column numbers: `cx` indexes `chars`, `rx` indexes `render`, and the two
 only agree on lines without tabs. Horizontal scrolling has to work off `rx`
 or indented lines jump by the wrong amount.
 
@@ -70,7 +70,7 @@ so a CRLF file saves back as LF.
 
 Search, `:` commands and the save-as prompt all run through one function that
 reads a line on the message bar. It takes an optional callback that fires on
-every keystroke, which is the whole trick behind search jumping as you type —
+every keystroke, which is the whole trick behind search jumping as you type:
 the callback moves the cursor, and ESC puts it back where it started.
 
 Highlighting stores one colour code per byte of `render`, not of `chars`,
@@ -78,12 +78,12 @@ because that's what gets drawn. Block comments are the awkward part: whether
 a line starts inside one depends on where the line above finished, so each
 row remembers whether it ended with a comment still open, and a row whose
 answer changes pushes a rescan down the file. Type `/*` at the top of a file
-and everything below it goes cyan until something closes it — and because C
+and everything below it goes cyan until something closes it, and because C
 comments don't nest, the first `*/` wins.
 
 ## Not done yet
 
-- SIGWINCH — resizing the terminal mid-session doesn't re-measure
+- SIGWINCH: resizing the terminal mid-session doesn't re-measure
 - C is the only filetype in the table
 - search only finds the first match on a line, so `n` steps line by line
 - normal mode lets the cursor sit one past the last character; vim clamps it

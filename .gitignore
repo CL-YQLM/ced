@@ -4,3 +4,4 @@ ced-asan
 *.d
 core
 *.dSYM/
+__pycache__/

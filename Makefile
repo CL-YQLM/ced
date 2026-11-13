@@ -12,7 +12,25 @@ ced: ced.c
 ced-asan: ced.c
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -o $@ $<
 
-clean:
-	rm -f ced ced-asan
+# The suites drive ced on a real pty and look for ./ced, so they run from
+# here rather than from inside tests/.
+test: ced
+	python3 tests/test_editor.py
+	python3 tests/test_highlight.py
 
-.PHONY: clean
+# leak_canary leaks on purpose. A clean leak report from ced proves nothing
+# unless leak checking is known to work in the first place, and that is what
+# the canary is for; its non-zero exit is expected and ignored.
+#
+# It gets built under /tmp deliberately. LeakSanitizer cannot symbolize a
+# binary sitting on a mounted Windows filesystem, and instead of failing it
+# spins forever printing DEADLYSIGNAL, which is no fun to debug twice.
+test-asan: ced-asan
+	$(CC) -g -fsanitize=address -o /tmp/ced_leak_canary tests/leak_canary.c
+	-ASAN_OPTIONS=detect_leaks=1 /tmp/ced_leak_canary
+	CED_BIN=./ced-asan ASAN_OPTIONS=detect_leaks=1 python3 tests/asan_drive.py
+
+clean:
+	rm -f ced ced-asan /tmp/ced_leak_canary
+
+.PHONY: clean test test-asan
